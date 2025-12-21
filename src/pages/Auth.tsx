@@ -7,9 +7,12 @@ import { Label } from '@/components/ui/label';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { useToast } from '@/hooks/use-toast';
+import { Mail, CheckCircle, ArrowLeft } from 'lucide-react';
 
 const Auth = () => {
   const [isLoading, setIsLoading] = useState(false);
+  const [showConfirmation, setShowConfirmation] = useState(false);
+  const [signUpEmail, setSignUpEmail] = useState('');
   const { signIn, signUp } = useAuth();
   const navigate = useNavigate();
   const { toast } = useToast();
@@ -69,15 +72,79 @@ const Auth = () => {
         variant: "destructive"
       });
     } else {
-      toast({
-        title: "Account created!",
-        description: "You have successfully created your account and signed in."
-      });
-      navigate('/');
+      // Show confirmation message instead of redirecting
+      setSignUpEmail(signUpForm.email);
+      setShowConfirmation(true);
     }
 
     setIsLoading(false);
   };
+
+  const handleBackToSignIn = () => {
+    setShowConfirmation(false);
+    setSignUpForm({
+      email: '',
+      password: '',
+      username: '',
+      displayName: ''
+    });
+  };
+
+  // Show email confirmation screen
+  if (showConfirmation) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-background to-muted p-4">
+        <Card className="w-full max-w-md">
+          <CardHeader className="text-center space-y-4">
+            <div className="mx-auto w-16 h-16 bg-primary/10 rounded-full flex items-center justify-center">
+              <Mail className="h-8 w-8 text-primary" />
+            </div>
+            <CardTitle className="text-2xl font-bold">Check Your Email</CardTitle>
+            <CardDescription className="text-base">
+              We've sent a confirmation link to
+            </CardDescription>
+            <p className="font-semibold text-primary text-lg">{signUpEmail}</p>
+          </CardHeader>
+          <CardContent className="space-y-6">
+            <div className="bg-secondary/50 rounded-lg p-4 space-y-3">
+              <div className="flex items-start gap-3">
+                <CheckCircle className="h-5 w-5 text-green-500 mt-0.5 flex-shrink-0" />
+                <p className="text-sm text-muted-foreground">
+                  Click the link in the email to verify your account
+                </p>
+              </div>
+              <div className="flex items-start gap-3">
+                <CheckCircle className="h-5 w-5 text-green-500 mt-0.5 flex-shrink-0" />
+                <p className="text-sm text-muted-foreground">
+                  After verification, you can sign in to ChatApp
+                </p>
+              </div>
+              <div className="flex items-start gap-3">
+                <CheckCircle className="h-5 w-5 text-green-500 mt-0.5 flex-shrink-0" />
+                <p className="text-sm text-muted-foreground">
+                  Check your spam folder if you don't see the email
+                </p>
+              </div>
+            </div>
+
+            <div className="text-center text-sm text-muted-foreground">
+              <p>Didn't receive the email?</p>
+              <p className="mt-1">Make sure you entered the correct email address</p>
+            </div>
+
+            <Button 
+              variant="outline" 
+              className="w-full" 
+              onClick={handleBackToSignIn}
+            >
+              <ArrowLeft className="h-4 w-4 mr-2" />
+              Back to Sign In
+            </Button>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-background to-muted p-4">
