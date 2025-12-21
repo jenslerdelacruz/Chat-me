@@ -1,7 +1,7 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
-import { Video, VideoOff, Mic, MicOff, PhoneOff } from 'lucide-react';
+import { Video, VideoOff, Mic, MicOff, PhoneOff, RefreshCw } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 
 interface VideoCallProps {
@@ -30,8 +30,12 @@ export const VideoCall: React.FC<VideoCallProps> = ({
   const [isCameraOn, setIsCameraOn] = useState(true);
   const [isMicOn, setIsMicOn] = useState(true);
   const [participants, setParticipants] = useState<any[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [currentRoomName, setCurrentRoomName] = useState<string | null>(null);
+  const initAttempted = useRef(false);
 
-  const createRoom = () => {
+  const createRoom = useCallback(() => {
     const roomName = `chatapp-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const jitsiRoomUrl = `https://meet.jit.si/${roomName}`;
     
@@ -40,61 +44,65 @@ export const VideoCall: React.FC<VideoCallProps> = ({
     }
     
     return roomName;
-  };
+  }, [onRoomCreated]);
 
-  const initJitsi = (roomName: string) => {
-    console.log('Initializing Jitsi with room:', roomName);
-    if (!jitsiContainerRef.current) {
-      console.error('Jitsi container ref not found');
-      return;
-    }
+  const loadJitsiScript = (): Promise<void> => {
+    return new Promise((resolve, reject) => {
+      if (window.JitsiMeetExternalAPI) {
+        console.log('Jitsi API already loaded');
+        resolve();
+        return;
+      }
 
-    if (!window.JitsiMeetExternalAPI) {
+      // Check if script is already being loaded
+      const existingScript = document.querySelector('script[src="https://meet.jit.si/external_api.js"]');
+      if (existingScript) {
+        existingScript.addEventListener('load', () => resolve());
+        existingScript.addEventListener('error', () => reject(new Error('Failed to load Jitsi script')));
+        return;
+      }
+
       console.log('Loading Jitsi Meet API script...');
       const script = document.createElement('script');
       script.src = 'https://meet.jit.si/external_api.js';
       script.async = true;
       script.onload = () => {
         console.log('Jitsi script loaded successfully');
-        startJitsiMeeting(roomName);
+        resolve();
       };
-      script.onerror = (error) => {
-        console.error('Failed to load Jitsi script:', error);
-        setIsJoined(false);
-        toast({
-          title: "Error",
-          description: "Failed to load video call. Please check your internet connection.",
-          variant: "destructive"
-        });
+      script.onerror = () => {
+        console.error('Failed to load Jitsi script');
+        reject(new Error('Failed to load video call service. Please check your internet connection.'));
       };
       document.head.appendChild(script);
-    } else {
-      console.log('Jitsi API already available');
-      startJitsiMeeting(roomName);
-    }
+    });
   };
 
-  const startJitsiMeeting = (roomName: string) => {
+  const startJitsiMeeting = useCallback((roomName: string) => {
     console.log('Starting Jitsi meeting with room:', roomName);
+    
     if (!jitsiContainerRef.current) {
       console.error('Container not found when starting meeting');
+      setError('Video container not ready. Please try again.');
+      setIsLoading(false);
       return;
     }
+
     if (!window.JitsiMeetExternalAPI) {
       console.error('Jitsi API not available when starting meeting');
-      toast({
-        title: "Error",
-        description: "Jitsi API could not be loaded. Please try again.",
-        variant: "destructive"
-      });
+      setError('Video service not loaded. Please try again.');
+      setIsLoading(false);
       return;
     }
 
     try {
+      // Clear any existing content in the container
+      jitsiContainerRef.current.innerHTML = '';
+
       const options = {
         roomName: roomName,
         width: '100%',
-        height: 400,
+        height: '100%',
         parentNode: jitsiContainerRef.current,
         configOverwrite: {
           startWithAudioMuted: false,
@@ -102,6 +110,8 @@ export const VideoCall: React.FC<VideoCallProps> = ({
           prejoinPageEnabled: false,
           enableWelcomePage: false,
           disableDeepLinking: true,
+          disableThirdPartyRequests: true,
+          enableClosePage: false,
         },
         interfaceConfigOverwrite: {
           TOOLBAR_BUTTONS: [
@@ -113,6 +123,7 @@ export const VideoCall: React.FC<VideoCallProps> = ({
           SHOW_POWERED_BY: false,
           SETTINGS_SECTIONS: ['devices'],
           DISABLE_JOIN_LEAVE_NOTIFICATIONS: true,
+          MOBILE_APP_PROMO: false,
         },
         userInfo: {
           displayName: `User-${Math.random().toString(36).substr(2, 5)}`
@@ -136,6 +147,8 @@ export const VideoCall: React.FC<VideoCallProps> = ({
       jitsiApi.addEventListener('videoConferenceJoined', () => {
         console.log('Video conference joined successfully');
         setIsJoined(true);
+        setIsLoading(false);
+        setError(null);
         toast({
           title: "Call Connected",
           description: "Video call connected successfully!",
@@ -162,14 +175,57 @@ export const VideoCall: React.FC<VideoCallProps> = ({
         onClose();
       });
 
+      // Handle connection errors
+      jitsiApi.addEventListener('errorOccurred', (error: any) => {
+        console.error('Jitsi error occurred:', error);
+        if (error.error?.name === 'conference.connectionError') {
+          setError('Connection failed. Please check your internet and try again.');
+          setIsLoading(false);
+        }
+      });
+
       setApi(jitsiApi);
     } catch (error) {
       console.error('Error creating Jitsi API:', error);
+      setError('Failed to initialize video call. Please try again.');
+      setIsLoading(false);
+    }
+  }, [onClose, toast]);
+
+  const initJitsi = useCallback(async (roomName: string) => {
+    console.log('Initializing Jitsi with room:', roomName);
+    setIsLoading(true);
+    setError(null);
+    setCurrentRoomName(roomName);
+
+    try {
+      await loadJitsiScript();
+      
+      // Wait a bit for the container to be fully rendered
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      if (jitsiContainerRef.current) {
+        startJitsiMeeting(roomName);
+      } else {
+        console.error('Jitsi container ref not found after delay');
+        setError('Video container not ready. Please try again.');
+        setIsLoading(false);
+      }
+    } catch (err: any) {
+      console.error('Failed to initialize Jitsi:', err);
+      setError(err.message || 'Failed to load video call. Please try again.');
+      setIsLoading(false);
       toast({
         title: "Error",
-        description: "Failed to initialize video call. Please try again.",
+        description: err.message || "Failed to load video call. Please check your internet connection.",
         variant: "destructive"
       });
+    }
+  }, [startJitsiMeeting, toast]);
+
+  const retryConnection = () => {
+    if (currentRoomName) {
+      initJitsi(currentRoomName);
     }
   };
 
@@ -179,6 +235,10 @@ export const VideoCall: React.FC<VideoCallProps> = ({
       setApi(null);
     }
     setIsJoined(false);
+    setIsLoading(false);
+    setError(null);
+    setCurrentRoomName(null);
+    initAttempted.current = false;
     onClose();
   };
 
@@ -195,7 +255,8 @@ export const VideoCall: React.FC<VideoCallProps> = ({
   };
 
   useEffect(() => {
-    if (isOpen) {
+    if (isOpen && !initAttempted.current) {
+      initAttempted.current = true;
       let roomName: string;
       if (roomUrl) {
         const urlParts = roomUrl.split('/');
@@ -204,15 +265,28 @@ export const VideoCall: React.FC<VideoCallProps> = ({
         roomName = createRoom();
       }
       
-      initJitsi(roomName);
+      // Small delay to ensure dialog content is mounted
+      const timer = setTimeout(() => {
+        initJitsi(roomName);
+      }, 300);
+
+      return () => clearTimeout(timer);
     }
 
-    return () => {
+    if (!isOpen) {
+      // Reset state when dialog closes
       if (api) {
         api.dispose();
+        setApi(null);
       }
-    };
-  }, [isOpen, roomUrl]);
+      setIsJoined(false);
+      setIsLoading(false);
+      setError(null);
+      setParticipants([]);
+      setCurrentRoomName(null);
+      initAttempted.current = false;
+    }
+  }, [isOpen, roomUrl, createRoom, initJitsi, api]);
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
@@ -259,25 +333,49 @@ export const VideoCall: React.FC<VideoCallProps> = ({
             {!isJoined && (
               <div className="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-background/95 via-background/90 to-primary/10 backdrop-blur-lg rounded-xl md:rounded-2xl">
                 <div className="text-center space-y-4 md:space-y-6 px-4">
-                  <div className="relative">
-                    <div className="w-16 h-16 md:w-24 md:h-24 mx-auto bg-gradient-to-br from-primary/30 to-secondary/30 rounded-full flex items-center justify-center shadow-2xl animate-pulse">
-                      <Video className="h-8 w-8 md:h-12 md:w-12 text-primary" />
-                    </div>
-                    <div className="absolute inset-0 w-16 h-16 md:w-24 md:h-24 mx-auto rounded-full border-4 border-primary/30 animate-ping" />
-                  </div>
-                  <div className="space-y-2 md:space-y-3">
-                    <p className="text-lg md:text-xl font-bold text-foreground">Connecting to call...</p>
-                    <p className="text-xs md:text-sm text-muted-foreground max-w-sm mx-auto">
-                      Please wait while we establish the connection. This may take a few moments.
-                    </p>
-                  </div>
-                  <div className="flex justify-center">
-                    <div className="flex space-x-1 md:space-x-2">
-                      <div className="w-2 h-2 md:w-3 md:h-3 bg-gradient-to-r from-primary to-secondary rounded-full animate-bounce [animation-delay:-0.3s]" />
-                      <div className="w-2 h-2 md:w-3 md:h-3 bg-gradient-to-r from-primary to-secondary rounded-full animate-bounce [animation-delay:-0.15s]" />
-                      <div className="w-2 h-2 md:w-3 md:h-3 bg-gradient-to-r from-primary to-secondary rounded-full animate-bounce" />
-                    </div>
-                  </div>
+                  {error ? (
+                    <>
+                      <div className="w-16 h-16 md:w-24 md:h-24 mx-auto bg-gradient-to-br from-destructive/30 to-destructive/10 rounded-full flex items-center justify-center shadow-2xl">
+                        <VideoOff className="h-8 w-8 md:h-12 md:w-12 text-destructive" />
+                      </div>
+                      <div className="space-y-2 md:space-y-3">
+                        <p className="text-lg md:text-xl font-bold text-destructive">Connection Failed</p>
+                        <p className="text-xs md:text-sm text-muted-foreground max-w-sm mx-auto">
+                          {error}
+                        </p>
+                      </div>
+                      <Button
+                        onClick={retryConnection}
+                        className="mt-4"
+                        disabled={isLoading}
+                      >
+                        <RefreshCw className={`h-4 w-4 mr-2 ${isLoading ? 'animate-spin' : ''}`} />
+                        Try Again
+                      </Button>
+                    </>
+                  ) : (
+                    <>
+                      <div className="relative">
+                        <div className="w-16 h-16 md:w-24 md:h-24 mx-auto bg-gradient-to-br from-primary/30 to-secondary/30 rounded-full flex items-center justify-center shadow-2xl animate-pulse">
+                          <Video className="h-8 w-8 md:h-12 md:w-12 text-primary" />
+                        </div>
+                        <div className="absolute inset-0 w-16 h-16 md:w-24 md:h-24 mx-auto rounded-full border-4 border-primary/30 animate-ping" />
+                      </div>
+                      <div className="space-y-2 md:space-y-3">
+                        <p className="text-lg md:text-xl font-bold text-foreground">Connecting to call...</p>
+                        <p className="text-xs md:text-sm text-muted-foreground max-w-sm mx-auto">
+                          Please wait while we establish the connection. This may take a few moments.
+                        </p>
+                      </div>
+                      <div className="flex justify-center">
+                        <div className="flex space-x-1 md:space-x-2">
+                          <div className="w-2 h-2 md:w-3 md:h-3 bg-gradient-to-r from-primary to-secondary rounded-full animate-bounce [animation-delay:-0.3s]" />
+                          <div className="w-2 h-2 md:w-3 md:h-3 bg-gradient-to-r from-primary to-secondary rounded-full animate-bounce [animation-delay:-0.15s]" />
+                          <div className="w-2 h-2 md:w-3 md:h-3 bg-gradient-to-r from-primary to-secondary rounded-full animate-bounce" />
+                        </div>
+                      </div>
+                    </>
+                  )}
                 </div>
               </div>
             )}
