@@ -79,6 +79,7 @@ export type Database = {
           image_url: string | null
           message_type: string
           reactions: Json | null
+          seen_by: Json | null
           sender_id: string
           user_id: string | null
         }
@@ -90,6 +91,7 @@ export type Database = {
           image_url?: string | null
           message_type?: string
           reactions?: Json | null
+          seen_by?: Json | null
           sender_id: string
           user_id?: string | null
         }
@@ -101,6 +103,7 @@ export type Database = {
           image_url?: string | null
           message_type?: string
           reactions?: Json | null
+          seen_by?: Json | null
           sender_id?: string
           user_id?: string | null
         }
