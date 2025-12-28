@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@/hooks/useAuth';
 import { supabase } from '@/integrations/supabase/client';
@@ -7,9 +7,10 @@ import { Input } from '@/components/ui/input';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter } from '@/components/ui/dialog';
-import { Send, Image, User, Plus, Settings, LogOut, UserPlus, ArrowLeft, Video, MessageCircle, Phone, PhoneOff } from 'lucide-react';
+import { Send, Image, User, Plus, Settings, LogOut, UserPlus, ArrowLeft, Video, MessageCircle, Phone, PhoneOff, Check, CheckCheck, Smile } from 'lucide-react';
 import { VideoCall } from '@/components/VideoCall';
 import { Badge } from '@/components/ui/badge';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 
 // Simple toast mock function (replace with actual useToast later)
 const useToast = () => ({
@@ -21,15 +22,19 @@ interface Message {
   id: string;
   content: string | null;
   image_url?: string | null;
-  message_type: 'text' | 'image' | 'call_info'; // Added 'call_info' type
+  message_type: 'text' | 'image' | 'call_info';
   created_at: string;
   sender_id: string;
   conversation_id: string;
+  reactions?: { emoji: string; user_id: string }[];
+  seen_by?: string[];
   sender_profile?: {
     display_name: string;
     avatar_url?: string;
   };
 }
+
+const REACTION_EMOJIS = ['❤️', '😂', '😮', '😢', '😡', '👍'];
 
 interface Conversation {
   id: string;
@@ -78,6 +83,11 @@ const Chat = () => {
   const [incomingCall, setIncomingCall] = useState<IncomingCall | null>(null);
   const [userProfile, setUserProfile] = useState<Profile | null>(null);
   const [callEndChannel, setCallEndChannel] = useState<any>(null);
+  
+  // ----- Typing indicator state -----
+  const [typingUsers, setTypingUsers] = useState<Map<string, { user_id: string; display_name: string }>>(new Map());
+  const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const typingChannelRef = useRef<any>(null);
 
   useEffect(() => {
     if (user) {
@@ -93,8 +103,13 @@ const Chat = () => {
     if (selectedConversation) {
       fetchMessages();
       const subscription = subscribeToMessages();
+      subscribeToTyping();
+      markMessagesAsSeen();
       return () => {
         subscription.unsubscribe();
+        if (typingChannelRef.current) {
+          supabase.removeChannel(typingChannelRef.current);
+        }
       };
     }
   }, [selectedConversation]);
@@ -232,10 +247,134 @@ const Chat = () => {
       if (error) throw error;
       const senderIds = [...new Set(messagesData?.map(m => m.sender_id) || [])];
       const { data: profilesData } = await supabase.from('profiles').select('user_id, display_name, avatar_url').in('user_id', senderIds);
-      const messagesWithProfiles = messagesData?.map(message => ({ ...message, message_type: message.message_type as 'text' | 'image' | 'call_info', sender_profile: profilesData?.find(p => p.user_id === message.sender_id) })) || [];
+      const messagesWithProfiles = messagesData?.map(message => ({ 
+        ...message, 
+        message_type: message.message_type as 'text' | 'image' | 'call_info', 
+        reactions: (message.reactions as { emoji: string; user_id: string }[] | null) || [],
+        seen_by: (message.seen_by as string[] | null) || [],
+        sender_profile: profilesData?.find(p => p.user_id === message.sender_id) 
+      })) || [];
       setMessages(messagesWithProfiles as Message[]);
     } catch (error: any) {
       console.error("Error loading messages:", error.message);
+    }
+  };
+  
+  // ----- Typing indicator functions -----
+  const subscribeToTyping = () => {
+    if (!selectedConversation || !user || !userProfile) return;
+    
+    typingChannelRef.current = supabase.channel(`typing-${selectedConversation}`);
+    
+    typingChannelRef.current
+      .on('broadcast', { event: 'typing' }, ({ payload }: { payload: { user_id: string; display_name: string; is_typing: boolean } }) => {
+        if (payload.user_id !== user.id) {
+          setTypingUsers(prev => {
+            const newMap = new Map(prev);
+            if (payload.is_typing) {
+              newMap.set(payload.user_id, { user_id: payload.user_id, display_name: payload.display_name });
+            } else {
+              newMap.delete(payload.user_id);
+            }
+            return newMap;
+          });
+        }
+      })
+      .subscribe();
+  };
+
+  const sendTypingIndicator = useCallback((isTyping: boolean) => {
+    if (!selectedConversation || !user || !userProfile) return;
+    
+    const channel = supabase.channel(`typing-${selectedConversation}`);
+    channel.send({
+      type: 'broadcast',
+      event: 'typing',
+      payload: { user_id: user.id, display_name: userProfile.display_name, is_typing: isTyping }
+    });
+  }, [selectedConversation, user, userProfile]);
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setNewMessage(e.target.value);
+    
+    // Send typing indicator
+    sendTypingIndicator(true);
+    
+    // Clear previous timeout
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current);
+    }
+    
+    // Set timeout to stop typing indicator after 2 seconds of no typing
+    typingTimeoutRef.current = setTimeout(() => {
+      sendTypingIndicator(false);
+    }, 2000);
+  };
+
+  // ----- Mark messages as seen -----
+  const markMessagesAsSeen = async () => {
+    if (!selectedConversation || !user) return;
+    
+    try {
+      // Get unread messages not sent by current user
+      const { data: unreadMessages } = await supabase
+        .from('messages')
+        .select('id, seen_by')
+        .eq('conversation_id', selectedConversation)
+        .neq('sender_id', user.id);
+      
+      if (!unreadMessages) return;
+      
+      // Update each message to include current user in seen_by
+      for (const msg of unreadMessages) {
+        const currentSeenBy = (msg.seen_by as string[] | null) || [];
+        if (!currentSeenBy.includes(user.id)) {
+          await supabase
+            .from('messages')
+            .update({ seen_by: [...currentSeenBy, user.id] })
+            .eq('id', msg.id);
+        }
+      }
+    } catch (error) {
+      console.error('Error marking messages as seen:', error);
+    }
+  };
+
+  // ----- Message reactions -----
+  const addReaction = async (messageId: string, emoji: string) => {
+    if (!user) return;
+    
+    try {
+      const message = messages.find(m => m.id === messageId);
+      if (!message) return;
+      
+      const currentReactions = message.reactions || [];
+      const existingReactionIndex = currentReactions.findIndex(
+        r => r.user_id === user.id && r.emoji === emoji
+      );
+      
+      let newReactions;
+      if (existingReactionIndex > -1) {
+        // Remove reaction if already exists
+        newReactions = currentReactions.filter((_, i) => i !== existingReactionIndex);
+      } else {
+        // Add new reaction
+        newReactions = [...currentReactions, { emoji, user_id: user.id }];
+      }
+      
+      const { error } = await supabase
+        .from('messages')
+        .update({ reactions: newReactions })
+        .eq('id', messageId);
+      
+      if (error) throw error;
+      
+      // Update local state
+      setMessages(prev => prev.map(m => 
+        m.id === messageId ? { ...m, reactions: newReactions } : m
+      ));
+    } catch (error) {
+      console.error('Error adding reaction:', error);
     }
   };
 
@@ -261,6 +400,13 @@ const Chat = () => {
     e.preventDefault();
     if (!newMessage.trim() || !selectedConversation || !user) return;
     setIsLoading(true);
+    
+    // Stop typing indicator
+    sendTypingIndicator(false);
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current);
+    }
+    
     try {
       await updateUserPresence();
       const { error } = await supabase.from('messages').insert({ conversation_id: selectedConversation, sender_id: user.id, content: newMessage, message_type: 'text' });
@@ -613,49 +759,135 @@ const Chat = () => {
               </div>
               <ScrollArea className="flex-1 p-4 bg-white">
                 <div className="space-y-4">
-                  {messages.map((message) => (
-                    <div key={message.id} className={`flex ${message.sender_id === user?.id ? 'justify-end' : 'justify-start'} animate-fade-in`}>
-                      <div className={`flex max-w-[85%] sm:max-w-[70%] ${message.sender_id === user?.id ? 'flex-row-reverse' : 'flex-row'} group`}>
-                        <Avatar className="h-11 w-11 mx-3 flex-shrink-0 border-3 border-gray-200 shadow-sm hover:scale-110 transition-all duration-300">
-                          <AvatarImage src={message.sender_profile?.avatar_url} />
-                          <AvatarFallback className="bg-gray-100 text-gray-600 font-bold text-lg"><User className="h-6 w-6" /></AvatarFallback>
-                        </Avatar>
-                        <div className={`relative rounded-2xl p-4 shadow-sm backdrop-blur-sm border-2 hover:scale-[1.02] transition-all duration-300 ${
-                          message.sender_id === user?.id 
-                            ? 'bg-blue-500 text-white border-blue-400 shadow-blue-100' 
-                            : 'bg-gray-100 text-gray-900 border-gray-200 shadow-gray-100'
-                        }`}>
-                          <div className="absolute inset-0 bg-gradient-to-br from-white/10 to-transparent rounded-2xl opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
-                          <div className="relative z-10">
-                            <div className="flex items-center justify-between mb-2">
-                              <p className="text-xs font-bold opacity-80 tracking-wider uppercase">{message.sender_profile?.display_name}</p>
-                              <p className="text-xs opacity-60">{new Date(message.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
+                  {messages.map((message, index) => {
+                    const isOwnMessage = message.sender_id === user?.id;
+                    const isLastOwnMessage = isOwnMessage && messages.filter(m => m.sender_id === user?.id).pop()?.id === message.id;
+                    const seenByOthers = message.seen_by?.filter(id => id !== user?.id) || [];
+                    const hasReactions = message.reactions && message.reactions.length > 0;
+                    
+                    return (
+                      <div key={message.id} className={`flex ${isOwnMessage ? 'justify-end' : 'justify-start'} animate-fade-in`}>
+                        <div className={`flex max-w-[85%] sm:max-w-[70%] ${isOwnMessage ? 'flex-row-reverse' : 'flex-row'} group`}>
+                          <Avatar className="h-11 w-11 mx-3 flex-shrink-0 border-3 border-gray-200 shadow-sm hover:scale-110 transition-all duration-300">
+                            <AvatarImage src={message.sender_profile?.avatar_url} />
+                            <AvatarFallback className="bg-gray-100 text-gray-600 font-bold text-lg"><User className="h-6 w-6" /></AvatarFallback>
+                          </Avatar>
+                          <div className="flex flex-col">
+                            <div className={`relative rounded-2xl p-4 shadow-sm backdrop-blur-sm border-2 hover:scale-[1.02] transition-all duration-300 ${
+                              isOwnMessage 
+                                ? 'bg-blue-500 text-white border-blue-400 shadow-blue-100' 
+                                : 'bg-gray-100 text-gray-900 border-gray-200 shadow-gray-100'
+                            }`}>
+                              <div className="absolute inset-0 bg-gradient-to-br from-white/10 to-transparent rounded-2xl opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
+                              <div className="relative z-10">
+                                <div className="flex items-center justify-between mb-2">
+                                  <p className="text-xs font-bold opacity-80 tracking-wider uppercase">{message.sender_profile?.display_name}</p>
+                                  <p className="text-xs opacity-60">{new Date(message.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
+                                </div>
+                                {message.message_type === 'text' && (
+                                  <p className="break-words text-base leading-relaxed font-medium">{message.content}</p>
+                                )}
+                                {message.message_type === 'image' && (
+                                  <div className="relative overflow-hidden rounded-xl shadow-sm">
+                                    <img 
+                                      src={message.image_url!} 
+                                      alt="Shared" 
+                                      className="max-w-full max-h-80 h-auto cursor-pointer hover:scale-110 transition-all duration-500 rounded-xl" 
+                                      onClick={() => window.open(message.image_url!, '_blank')} 
+                                    />
+                                    <div className="absolute inset-0 bg-gradient-to-t from-black/20 to-transparent opacity-0 hover:opacity-100 transition-opacity duration-300 rounded-xl" />
+                                  </div>
+                                )}
+                                {message.message_type === 'call_info' && (
+                                  <div className="flex items-center justify-center gap-2 p-3 bg-gradient-to-r from-blue-50 to-blue-100 rounded-xl border border-blue-200">
+                                    <Video className="h-4 w-4 text-blue-600" />
+                                    <p className="text-sm font-semibold text-center text-blue-900">{message.content}</p>
+                                  </div>
+                                )}
+                              </div>
+                              
+                              {/* Reaction button */}
+                              <Popover>
+                                <PopoverTrigger asChild>
+                                  <button className={`absolute -bottom-2 ${isOwnMessage ? '-left-2' : '-right-2'} opacity-0 group-hover:opacity-100 transition-opacity bg-white border border-gray-200 rounded-full p-1.5 shadow-md hover:scale-110`}>
+                                    <Smile className="h-4 w-4 text-gray-500" />
+                                  </button>
+                                </PopoverTrigger>
+                                <PopoverContent className="w-auto p-2 bg-white border border-gray-200 shadow-lg rounded-full">
+                                  <div className="flex gap-1">
+                                    {REACTION_EMOJIS.map(emoji => (
+                                      <button 
+                                        key={emoji} 
+                                        onClick={() => addReaction(message.id, emoji)}
+                                        className="hover:scale-125 transition-transform p-1 text-lg"
+                                      >
+                                        {emoji}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </PopoverContent>
+                              </Popover>
                             </div>
-                            {message.message_type === 'text' && (
-                              <p className="break-words text-base leading-relaxed font-medium">{message.content}</p>
-                            )}
-                            {message.message_type === 'image' && (
-                              <div className="relative overflow-hidden rounded-xl shadow-sm">
-                                <img 
-                                  src={message.image_url!} 
-                                  alt="Shared" 
-                                  className="max-w-full max-h-80 h-auto cursor-pointer hover:scale-110 transition-all duration-500 rounded-xl" 
-                                  onClick={() => window.open(message.image_url!, '_blank')} 
-                                />
-                                <div className="absolute inset-0 bg-gradient-to-t from-black/20 to-transparent opacity-0 hover:opacity-100 transition-opacity duration-300 rounded-xl" />
+                            
+                            {/* Reactions display */}
+                            {hasReactions && (
+                              <div className={`flex flex-wrap gap-1 mt-1 ${isOwnMessage ? 'justify-end' : 'justify-start'}`}>
+                                {Object.entries(
+                                  message.reactions!.reduce((acc, r) => {
+                                    acc[r.emoji] = (acc[r.emoji] || 0) + 1;
+                                    return acc;
+                                  }, {} as Record<string, number>)
+                                ).map(([emoji, count]) => (
+                                  <button 
+                                    key={emoji}
+                                    onClick={() => addReaction(message.id, emoji)}
+                                    className="bg-white border border-gray-200 rounded-full px-2 py-0.5 text-sm shadow-sm hover:scale-105 transition-transform flex items-center gap-1"
+                                  >
+                                    <span>{emoji}</span>
+                                    <span className="text-xs text-gray-600">{count}</span>
+                                  </button>
+                                ))}
                               </div>
                             )}
-                            {message.message_type === 'call_info' && (
-                              <div className="flex items-center justify-center gap-2 p-3 bg-gradient-to-r from-blue-50 to-blue-100 rounded-xl border border-blue-200">
-                                <Video className="h-4 w-4 text-blue-600" />
-                                <p className="text-sm font-semibold text-center text-blue-900">{message.content}</p>
+                            
+                            {/* Seen status for own messages */}
+                            {isOwnMessage && isLastOwnMessage && (
+                              <div className={`flex items-center gap-1 mt-1 ${isOwnMessage ? 'justify-end' : 'justify-start'}`}>
+                                {seenByOthers.length > 0 ? (
+                                  <span className="flex items-center gap-1 text-xs text-blue-500">
+                                    <CheckCheck className="h-4 w-4" />
+                                    Seen
+                                  </span>
+                                ) : (
+                                  <span className="flex items-center gap-1 text-xs text-gray-400">
+                                    <Check className="h-4 w-4" />
+                                    Sent
+                                  </span>
+                                )}
                               </div>
                             )}
                           </div>
                         </div>
                       </div>
+                    );
+                  })}
+                  
+                  {/* Typing indicator */}
+                  {typingUsers.size > 0 && (
+                    <div className="flex justify-start animate-fade-in">
+                      <div className="flex items-center gap-2 bg-gray-100 rounded-2xl px-4 py-3 border-2 border-gray-200">
+                        <div className="flex gap-1">
+                          <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                          <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                          <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+                        </div>
+                        <span className="text-sm text-gray-500">
+                          {Array.from(typingUsers.values()).map(u => u.display_name).join(', ')} is typing...
+                        </span>
+                      </div>
                     </div>
-                  ))}
+                  )}
+                  
                   <div ref={messagesEndRef} />
                 </div>
               </ScrollArea>
@@ -664,7 +896,7 @@ const Chat = () => {
                   <div className="flex-1 relative">
                     <Input 
                       value={newMessage} 
-                      onChange={(e) => setNewMessage(e.target.value)} 
+                      onChange={handleInputChange} 
                       placeholder="Type your message..." 
                       disabled={isLoading} 
                       className="w-full border border-gray-300 focus:border-blue-500 focus:ring-4 focus:ring-blue-50 rounded-full py-3 px-5 text-base bg-white shadow-sm hover:shadow-md transition-all duration-300 font-medium placeholder:text-gray-400" 
