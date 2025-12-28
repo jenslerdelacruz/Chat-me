@@ -78,7 +78,9 @@ export type Database = {
           id: string
           image_url: string | null
           message_type: string
+          reactions: Json | null
           sender_id: string
+          user_id: string | null
         }
         Insert: {
           content?: string | null
@@ -87,7 +89,9 @@ export type Database = {
           id?: string
           image_url?: string | null
           message_type?: string
+          reactions?: Json | null
           sender_id: string
+          user_id?: string | null
         }
         Update: {
           content?: string | null
@@ -96,7 +100,9 @@ export type Database = {
           id?: string
           image_url?: string | null
           message_type?: string
+          reactions?: Json | null
           sender_id?: string
+          user_id?: string | null
         }
         Relationships: [
           {
@@ -105,6 +111,13 @@ export type Database = {
             isOneToOne: false
             referencedRelation: "conversations"
             referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "messages_user_id_fkey"
+            columns: ["user_id"]
+            isOneToOne: false
+            referencedRelation: "profiles"
+            referencedColumns: ["user_id"]
           },
         ]
       }
