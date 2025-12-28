@@ -7,10 +7,12 @@ import { Input } from '@/components/ui/input';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter } from '@/components/ui/dialog';
-import { Send, Image, User, Plus, Settings, LogOut, UserPlus, ArrowLeft, Video, MessageCircle, Phone, PhoneOff, Check, CheckCheck, Smile } from 'lucide-react';
+import { Send, Image, User, Plus, Settings, LogOut, UserPlus, ArrowLeft, Video, MessageCircle, Phone, PhoneOff, Check, CheckCheck, Smile, Edit2, Trash2, X } from 'lucide-react';
 import { VideoCall } from '@/components/VideoCall';
 import { Badge } from '@/components/ui/badge';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { usePushNotifications } from '@/hooks/usePushNotifications';
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog';
 
 // Simple toast mock function (replace with actual useToast later)
 const useToast = () => ({
@@ -65,6 +67,7 @@ const Chat = () => {
   const { user, signOut } = useAuth();
   const navigate = useNavigate();
   const { toast } = useToast();
+  const { sendNotification, requestPermission } = usePushNotifications();
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [selectedConversation, setSelectedConversation] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -88,6 +91,11 @@ const Chat = () => {
   const [typingUsers, setTypingUsers] = useState<Map<string, { user_id: string; display_name: string }>>(new Map());
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const typingChannelRef = useRef<any>(null);
+  
+  // ----- Message editing/deletion state -----
+  const [editingMessage, setEditingMessage] = useState<Message | null>(null);
+  const [editContent, setEditContent] = useState('');
+  const [messageToDelete, setMessageToDelete] = useState<Message | null>(null);
 
   useEffect(() => {
     if (user) {
@@ -95,7 +103,8 @@ const Chat = () => {
       fetchConversations();
       updateUserPresence();
       subscribeToPresence();
-      subscribeToCalls(); 
+      subscribeToCalls();
+      requestPermission(); // Request notification permission on load
     }
   }, [user]);
 
@@ -384,16 +393,103 @@ const Chat = () => {
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `conversation_id=eq.${selectedConversation}`},
         async (payload) => {
           const newMessagePayload = payload.new as any;
-          const { data: profileData } = await supabase.from('profiles').select('user_id, display_name, avatar_url').eq('user_id', newMessagePayload.sender_id).single();
-          const messageWithProfile: Message = { ...newMessagePayload, message_type: newMessagePayload.message_type as 'text' | 'image' | 'call_info', sender_profile: profileData };
+          const { data: profileData } = await supabase.from('profiles').select('user_id, display_name, avatar_url').eq('user_id', newMessagePayload.sender_id).maybeSingle();
+          const messageWithProfile: Message = { 
+            ...newMessagePayload, 
+            message_type: newMessagePayload.message_type as 'text' | 'image' | 'call_info',
+            reactions: newMessagePayload.reactions || [],
+            seen_by: newMessagePayload.seen_by || [],
+            sender_profile: profileData 
+          };
           setMessages(prevMessages => {
             const exists = prevMessages.some(msg => msg.id === messageWithProfile.id);
             if (exists) return prevMessages;
             return [...prevMessages, messageWithProfile];
           });
+          
+          // Send push notification for new messages from others
+          if (newMessagePayload.sender_id !== user?.id && profileData) {
+            sendNotification(`New message from ${profileData.display_name}`, {
+              body: newMessagePayload.content || 'Sent an image',
+              tag: `message-${newMessagePayload.id}`
+            });
+          }
+        }
+      )
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'messages', filter: `conversation_id=eq.${selectedConversation}`},
+        async (payload) => {
+          const updatedMessage = payload.new as any;
+          setMessages(prevMessages => 
+            prevMessages.map(msg => 
+              msg.id === updatedMessage.id 
+                ? { 
+                    ...msg, 
+                    content: updatedMessage.content,
+                    reactions: updatedMessage.reactions || [],
+                    seen_by: updatedMessage.seen_by || []
+                  } 
+                : msg
+            )
+          );
+        }
+      )
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'messages', filter: `conversation_id=eq.${selectedConversation}`},
+        async (payload) => {
+          const deletedMessage = payload.old as any;
+          setMessages(prevMessages => prevMessages.filter(msg => msg.id !== deletedMessage.id));
         }
       )
       .subscribe();
+  };
+  
+  // ----- Message editing -----
+  const startEditMessage = (message: Message) => {
+    setEditingMessage(message);
+    setEditContent(message.content || '');
+  };
+  
+  const cancelEdit = () => {
+    setEditingMessage(null);
+    setEditContent('');
+  };
+  
+  const saveEditMessage = async () => {
+    if (!editingMessage || !editContent.trim()) return;
+    
+    try {
+      const { error } = await supabase
+        .from('messages')
+        .update({ content: editContent.trim() })
+        .eq('id', editingMessage.id);
+      
+      if (error) throw error;
+      
+      setMessages(prev => prev.map(msg => 
+        msg.id === editingMessage.id ? { ...msg, content: editContent.trim() } : msg
+      ));
+      cancelEdit();
+    } catch (error) {
+      console.error('Error editing message:', error);
+    }
+  };
+  
+  // ----- Message deletion -----
+  const confirmDeleteMessage = async () => {
+    if (!messageToDelete) return;
+    
+    try {
+      const { error } = await supabase
+        .from('messages')
+        .delete()
+        .eq('id', messageToDelete.id);
+      
+      if (error) throw error;
+      
+      setMessages(prev => prev.filter(msg => msg.id !== messageToDelete.id));
+      setMessageToDelete(null);
+    } catch (error) {
+      console.error('Error deleting message:', error);
+    }
   };
   
   const sendMessage = async (e: React.FormEvent) => {
